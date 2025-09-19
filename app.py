@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import plotly.express as px
 from supabase import create_client, Client
 import os
@@ -386,9 +386,11 @@ def show_app():
 
     # View Reports
     elif menu == "View Reports":
-        st.header("Sales Reports")
+        st.header("Advanced Sales Reports")
         
-        col1, col2 = st.columns(2)
+        # Report filters
+        st.subheader("Report Filters")
+        col1, col2, col3 = st.columns(3)
         
         with col1:
             start_date = st.date_input("Start Date", value=date.today().replace(day=1))
@@ -396,36 +398,177 @@ def show_app():
         with col2:
             end_date = st.date_input("End Date", value=date.today())
         
-        if st.button("Generate Report"):
+        with col3:
+            # Product filter
+            products_df = get_products(user_id)
+            product_options = ["All Products"] + products_df['name'].tolist() if not products_df.empty else ["All Products"]
+            selected_product_filter = st.selectbox("Filter by Product", product_options)
+        
+        # Quick date range buttons
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            if st.button("Today"):
+                start_date = end_date = date.today()
+                st.rerun()
+        
+        with col2:
+            if st.button("This Week"):
+                end_date = date.today()
+                start_date = end_date - timedelta(days=6)
+                st.rerun()
+        
+        with col3:
+            if st.button("This Month"):
+                end_date = date.today()
+                start_date = end_date.replace(day=1)
+                st.rerun()
+        
+        with col4:
+            if st.button("Last 30 Days"):
+                end_date = date.today()
+                start_date = end_date - timedelta(days=29)
+                st.rerun()
+        
+        if st.button("Generate Advanced Report", type="primary"):
             if start_date <= end_date:
                 report_df = get_sales_report(user_id, start_date, end_date)
                 
+                # Apply product filter
+                if selected_product_filter != "All Products" and not report_df.empty:
+                    report_df = report_df[report_df['name'] == selected_product_filter]
+                
                 if not report_df.empty:
                     st.subheader(f"Sales Report: {start_date} to {end_date}")
+                    if selected_product_filter != "All Products":
+                        st.caption(f"Filtered by: {selected_product_filter}")
                     
-                    # Summary metrics
+                    # Enhanced summary metrics
                     total_sales = len(report_df)
                     total_profit = report_df['profit'].sum()
+                    total_revenue = (report_df['selling_price'] * report_df['quantity']).sum()
+                    total_cost = (report_df['buying_price'] * report_df['quantity']).sum()
+                    avg_profit_per_sale = total_profit / total_sales if total_sales > 0 else 0
+                    profit_margin = (total_profit / total_revenue * 100) if total_revenue > 0 else 0
                     
-                    col1, col2 = st.columns(2)
+                    # Display metrics in cards
+                    col1, col2, col3 = st.columns(3)
+                    
                     with col1:
                         st.metric("Total Sales", total_sales)
+                        st.metric("Total Revenue", f"KSh {total_revenue:,.2f}")
+                    
                     with col2:
                         st.metric("Total Profit", f"KSh {total_profit:,.2f}")
+                        st.metric("Total Cost", f"KSh {total_cost:,.2f}")
                     
-                    # Detailed report
+                    with col3:
+                        st.metric("Avg Profit/Sale", f"KSh {avg_profit_per_sale:,.2f}")
+                        st.metric("Profit Margin", f"{profit_margin:.1f}%")
+                    
+                    st.markdown("---")
+                    
+                    # Export functionality
+                    st.subheader("Export Data")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        # CSV export
+                        csv_data = report_df.to_csv(index=False)
+                        st.download_button(
+                            label="📥 Download CSV",
+                            data=csv_data,
+                            file_name=f"sales_report_{start_date}_{end_date}.csv",
+                            mime="text/csv"
+                        )
+                    
+                    with col2:
+                        # Summary export
+                        summary_data = f"""Sales Report Summary
+Period: {start_date} to {end_date}
+Product Filter: {selected_product_filter}
+
+Key Metrics:
+- Total Sales: {total_sales}
+- Total Revenue: KSh {total_revenue:,.2f}
+- Total Profit: KSh {total_profit:,.2f}
+- Total Cost: KSh {total_cost:,.2f}
+- Average Profit per Sale: KSh {avg_profit_per_sale:,.2f}
+- Profit Margin: {profit_margin:.1f}%
+
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+                        st.download_button(
+                            label="📋 Download Summary",
+                            data=summary_data,
+                            file_name=f"sales_summary_{start_date}_{end_date}.txt",
+                            mime="text/plain"
+                        )
+                    
+                    # Enhanced visualizations
+                    st.subheader("Analytics Charts")
+                    
+                    # Daily profit trend
+                    if len(report_df) > 0:
+                        daily_profit = report_df.groupby('date')['profit'].sum().reset_index()
+                        daily_revenue = report_df.groupby('date').apply(lambda x: (x['selling_price'] * x['quantity']).sum()).reset_index()
+                        daily_revenue.columns = ['date', 'revenue']
+                        
+                        tab1, tab2, tab3 = st.tabs(["Profit Trend", "Product Performance", "Revenue vs Cost"])
+                        
+                        with tab1:
+                            fig = px.line(daily_profit, x='date', y='profit', title='Daily Profit Trend', markers=True)
+                            fig.update_layout(xaxis_title='Date', yaxis_title='Profit (KSh)')
+                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        with tab2:
+                            # Product performance
+                            product_performance = report_df.groupby('name').agg({
+                                'profit': 'sum',
+                                'quantity': 'sum'
+                            }).reset_index().sort_values('profit', ascending=False)
+                            
+                            fig2 = px.bar(product_performance, x='name', y='profit', title='Profit by Product')
+                            fig2.update_layout(xaxis_title='Product', yaxis_title='Total Profit (KSh)')
+                            st.plotly_chart(fig2, use_container_width=True)
+                            
+                            # Top products table
+                            st.subheader("Top Performing Products")
+                            top_products = product_performance.head(10).copy()
+                            top_products.columns = ['Product', 'Total Profit (KSh)', 'Total Quantity Sold']
+                            st.dataframe(top_products, use_container_width=True)
+                        
+                        with tab3:
+                            # Revenue vs Cost analysis
+                            daily_analysis = report_df.groupby('date').agg({
+                                'profit': 'sum'
+                            }).reset_index()
+                            
+                            # Calculate revenue and cost separately
+                            daily_revenue = report_df.groupby('date').apply(
+                                lambda x: (x['selling_price'] * x['quantity']).sum()
+                            ).to_frame('revenue').reset_index()
+                            
+                            daily_cost = report_df.groupby('date').apply(
+                                lambda x: (x['buying_price'] * x['quantity']).sum()
+                            ).to_frame('cost').reset_index()
+                            
+                            # Merge all metrics
+                            daily_analysis = daily_analysis.merge(daily_revenue, on='date').merge(daily_cost, on='date')
+                            
+                            fig3 = px.line(daily_analysis, x='date', y=['revenue', 'cost'], title='Daily Revenue vs Cost')
+                            fig3.update_layout(xaxis_title='Date', yaxis_title='Amount (KSh)')
+                            st.plotly_chart(fig3, use_container_width=True)
+                    
+                    # Detailed report table
+                    st.subheader("Detailed Sales Data")
                     display_report = report_df[['date', 'name', 'buying_price', 'selling_price', 'quantity', 'profit']].copy()
+                    display_report = display_report.copy()  # Ensure it's a DataFrame
                     display_report.columns = ['Date', 'Product', 'Buying Price (KSh)', 'Selling Price (KSh)', 'Quantity', 'Profit (KSh)']
                     st.dataframe(display_report, use_container_width=True)
                     
-                    # Profit trend chart
-                    if len(report_df) > 0:
-                        daily_profit = report_df.groupby('date')['profit'].sum().reset_index()
-                        fig = px.line(daily_profit, x='date', y='profit', title='Daily Profit Trend')
-                        fig.update_layout(xaxis_title='Date', yaxis_title='Profit (KSh)')
-                        st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.info("No sales data found for the selected date range.")
+                    st.info("No sales data found for the selected criteria.")
             else:
                 st.error("End date must be after start date!")
 
