@@ -34,16 +34,23 @@ def sign_up(email, password, shop_name):
         
         if response.user:
             # Create shop profile
-            supabase.table("shops").insert({
+            shop_result = supabase.table("shops").insert({
                 "id": response.user.id,
                 "shop_name": shop_name,
                 "created_at": datetime.now().isoformat()
             }).execute()
             
+            # Check if email confirmation is required
+            if not response.session:
+                return response, "Please check your email to confirm your account before signing in."
+            
             return response, None
-        return None, "Failed to create account"
+        elif hasattr(response, 'error') and response.error:
+            return None, f"Sign up failed: {response.error.message}"
+        else:
+            return None, "Failed to create account - unknown error"
     except Exception as e:
-        return None, str(e)
+        return None, f"Sign up error: {str(e)}"
 
 def sign_in(email, password):
     try:
@@ -51,9 +58,15 @@ def sign_in(email, password):
             "email": email,
             "password": password
         })
-        return response, None
+        
+        if response.user and response.session:
+            return response, None
+        elif hasattr(response, 'error') and response.error:
+            return None, f"Sign in failed: {response.error.message}"
+        else:
+            return None, "Sign in failed: Invalid credentials or unconfirmed email"
     except Exception as e:
-        return None, str(e)
+        return None, f"Sign in error: {str(e)}"
 
 def get_current_user():
     try:
@@ -209,9 +222,12 @@ def show_auth():
                 if shop_name and email and password:
                     response, error = sign_up(email, password, shop_name)
                     if error:
-                        st.error(f"Sign up failed: {error}")
+                        if "check your email" in error.lower():
+                            st.info(error)
+                        else:
+                            st.error(error)
                     else:
-                        st.success("Account created successfully! Please sign in.")
+                        st.success("Account created successfully! You can now sign in.")
                 else:
                     st.error("Please fill all fields")
 
@@ -562,10 +578,13 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                     
                     # Detailed report table
                     st.subheader("Detailed Sales Data")
-                    display_report = report_df[['date', 'name', 'buying_price', 'selling_price', 'quantity', 'profit']].copy()
-                    display_report = display_report.copy()  # Ensure it's a DataFrame
-                    display_report.columns = ['Date', 'Product', 'Buying Price (KSh)', 'Selling Price (KSh)', 'Quantity', 'Profit (KSh)']
-                    st.dataframe(display_report, use_container_width=True)
+                    display_columns = ['date', 'name', 'buying_price', 'selling_price', 'quantity', 'profit']
+                    if len(report_df) > 0:
+                        display_report = pd.DataFrame(report_df[display_columns])
+                        display_report.columns = ['Date', 'Product', 'Buying Price (KSh)', 'Selling Price (KSh)', 'Quantity', 'Profit (KSh)']
+                        st.dataframe(display_report, use_container_width=True)
+                    else:
+                        st.info("No detailed sales data to display.")
                     
                 else:
                     st.info("No sales data found for the selected criteria.")
