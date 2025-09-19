@@ -1,0 +1,553 @@
+# Duka Profit Tracker - Multi-Shop SaaS Application
+
+Here's a complete Streamlit application that uses Supabase for authentication and data storage, designed for multiple shop owners to track their daily profits:
+
+```python
+import streamlit as st
+import pandas as pd
+from datetime import datetime, date
+import plotly.express as px
+from supabase import create_client, Client
+import extra_streamlit_components as stx
+from streamlit_cookies_manager import EncryptedCookieManager
+import time
+
+# Initialize cookies
+cookies = EncryptedCookieManager(
+    prefix="duka_tracker_",
+    password=st.secrets["COOKIE_PASSWORD"] if "COOKIE_PASSWORD" in st.secrets else "default-password"
+)
+
+if not cookies.ready():
+    st.stop()
+
+# Initialize Supabase client
+@st.cache_resource
+def init_supabase():
+    supabase_url = st.secrets["SUPABASE_URL"]
+    supabase_key = st.secrets["SUPABASE_KEY"]
+    return create_client(supabase_url, supabase_key)
+
+supabase = init_supabase()
+
+# Set page config
+st.set_page_config(
+    page_title="Duka Profit Tracker",
+    page_icon="📊",
+    layout="wide"
+)
+
+# Custom CSS
+st.markdown("""
+    <style>
+    .main-header {
+        font-size: 3rem;
+        color: #1f77b4;
+        text-align: center;
+    }
+    .sub-header {
+        font-size: 1.5rem;
+        color: #ff7f0e;
+        border-bottom: 2px solid #ff7f0e;
+        padding-bottom: 0.2rem;
+        margin-top: 2rem;
+    }
+    .profit-positive {
+        color: green;
+        font-weight: bold;
+        font-size: 1.2rem;
+    }
+    .profit-negative {
+        color: red;
+        font-weight: bold;
+        font-size: 1.2rem;
+    }
+    .shop-card {
+        border: 1px solid #ccc;
+        border-radius: 10px;
+        padding: 15px;
+        margin: 10px 0;
+        background-color: #f9f9f9;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# Authentication functions
+def sign_up(email, password, shop_name):
+    try:
+        response = supabase.auth.sign_up({
+            "email": email,
+            "password": password,
+        })
+        
+        if response.user:
+            # Create shop profile
+            supabase.table("shops").insert({
+                "id": response.user.id,
+                "shop_name": shop_name,
+                "created_at": datetime.now().isoformat()
+            }).execute()
+            
+            return response, None
+        return None, "Failed to create account"
+    except Exception as e:
+        return None, str(e)
+
+def sign_in(email, password):
+    try:
+        response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": password
+        })
+        return response, None
+    except Exception as e:
+        return None, str(e)
+
+def get_current_user():
+    try:
+        return supabase.auth.get_user()
+    except:
+        return None
+
+def sign_out():
+    supabase.auth.sign_out()
+    cookies.remove("duka_user")
+    st.experimental_rerun()
+
+# Database functions
+def get_products(user_id):
+    try:
+        response = supabase.table("products").select("*").eq("shop_id", user_id).execute()
+        return pd.DataFrame(response.data)
+    except:
+        return pd.DataFrame()
+
+def add_product(user_id, name, buying_price, selling_price):
+    supabase.table("products").insert({
+        "shop_id": user_id,
+        "name": name,
+        "buying_price": buying_price,
+        "selling_price": selling_price,
+        "created_at": datetime.now().isoformat()
+    }).execute()
+
+def update_stock(user_id, product_id, quantity, stock_date):
+    supabase.table("stock").insert({
+        "shop_id": user_id,
+        "product_id": product_id,
+        "quantity": quantity,
+        "date": stock_date.isoformat(),
+        "created_at": datetime.now().isoformat()
+    }).execute()
+
+def record_sale(user_id, product_id, quantity, sale_date):
+    supabase.table("sales").insert({
+        "shop_id": user_id,
+        "product_id": product_id,
+        "quantity": quantity,
+        "date": sale_date.isoformat(),
+        "created_at": datetime.now().isoformat()
+    }).execute()
+
+def get_daily_profit(user_id, target_date):
+    try:
+        # Get sales for the day
+        sales_response = supabase.table("sales").select("*, products(buying_price, selling_price)").eq("shop_id", user_id).eq("date", target_date.isoformat()).execute()
+        
+        sales_data = sales_response.data
+        if not sales_data:
+            return 0, pd.DataFrame()
+            
+        # Process sales data
+        sales_list = []
+        total_profit = 0
+        
+        for sale in sales_data:
+            product_info = sale.get('products', {})
+            buying_price = product_info.get('buying_price', 0)
+            selling_price = product_info.get('selling_price', 0)
+            quantity = sale.get('quantity', 0)
+            
+            profit = (selling_price - buying_price) * quantity
+            total_profit += profit
+            
+            sales_list.append({
+                'name': product_info.get('name', 'Unknown'),
+                'buying_price': buying_price,
+                'selling_price': selling_price,
+                'sold_quantity': quantity,
+                'profit': profit
+            })
+        
+        return total_profit, pd.DataFrame(sales_list)
+    except Exception as e:
+        st.error(f"Error calculating profit: {e}")
+        return 0, pd.DataFrame()
+
+def get_sales_report(user_id, start_date, end_date):
+    try:
+        response = supabase.table("sales").select("*, products(name, buying_price, selling_price)").eq("shop_id", user_id).gte("date", start_date.isoformat()).lte("date", end_date.isoformat()).execute()
+        
+        sales_data = response.data
+        if not sales_data:
+            return pd.DataFrame()
+            
+        processed_data = []
+        for sale in sales_data:
+            product_info = sale.get('products', {})
+            processed_data.append({
+                'date': sale.get('date'),
+                'name': product_info.get('name', 'Unknown'),
+                'buying_price': product_info.get('buying_price', 0),
+                'selling_price': product_info.get('selling_price', 0),
+                'quantity': sale.get('quantity', 0),
+                'profit': (product_info.get('selling_price', 0) - product_info.get('buying_price', 0)) * sale.get('quantity', 0)
+            })
+        
+        return pd.DataFrame(processed_data)
+    except Exception as e:
+        st.error(f"Error generating report: {e}")
+        return pd.DataFrame()
+
+# Authentication UI
+def show_auth():
+    st.markdown('<h1 class="main-header">Duka Profit Tracker</h1>', unsafe_allow_html=True)
+    st.markdown("**Track your daily profits with ease**")
+    
+    tab1, tab2 = st.tabs(["Sign In", "Sign Up"])
+    
+    with tab1:
+        with st.form("sign_in_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In")
+            
+            if submitted:
+                if email and password:
+                    response, error = sign_in(email, password)
+                    if error:
+                        st.error(f"Sign in failed: {error}")
+                    else:
+                        cookies["duka_user"] = response.user.id
+                        st.experimental_rerun()
+                else:
+                    st.error("Please enter both email and password")
+    
+    with tab2:
+        with st.form("sign_up_form"):
+            shop_name = st.text_input("Shop Name")
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Create Account")
+            
+            if submitted:
+                if shop_name and email and password:
+                    response, error = sign_up(email, password, shop_name)
+                    if error:
+                        st.error(f"Sign up failed: {error}")
+                    else:
+                        st.success("Account created successfully! Please sign in.")
+                else:
+                    st.error("Please fill all fields")
+
+# Main app UI
+def show_app():
+    user = get_current_user()
+    if not user:
+        st.error("Authentication failed. Please sign in again.")
+        sign_out()
+        return
+    
+    user_id = user.user.id
+    
+    # Sidebar navigation
+    st.sidebar.image("https://cdn.pixabay.com/photo/2013/07/13/13/34/shop-161588_960_720.png", width=100)
+    st.sidebar.title("Navigation")
+    menu = st.sidebar.radio("Go to", ["Dashboard", "Add Products", "Update Stock", "Record Sales", "View Reports"])
+    
+    # User info and logout
+    st.sidebar.markdown("---")
+    shop_info = supabase.table("shops").select("shop_name").eq("id", user_id).execute()
+    shop_name = shop_info.data[0]["shop_name"] if shop_info.data else "Your Shop"
+    st.sidebar.write(f"Logged in as: **{shop_name}**")
+    if st.sidebar.button("Sign Out"):
+        sign_out()
+    
+    # Dashboard
+    if menu == "Dashboard":
+        st.markdown('<h2 class="sub-header">Dashboard</h2>', unsafe_allow_html=True)
+        
+        # Date selector
+        selected_date = st.date_input("Select date", value=date.today())
+        
+        # Display daily profit
+        profit, sales_details = get_daily_profit(user_id, selected_date)
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Selected Date", selected_date.strftime("%B %d, %Y"))
+        
+        with col2:
+            st.metric("Total Sales", f"{len(sales_details)} products" if not sales_details.empty else "0 products")
+        
+        with col3:
+            profit_class = "profit-positive" if profit >= 0 else "profit-negative"
+            st.metric("Daily Profit", f"KSh {profit:,.2f}")
+        
+        # Display sales details
+        if not sales_details.empty:
+            st.subheader("Sales Details")
+            display_df = sales_details[['name', 'buying_price', 'selling_price', 'sold_quantity', 'profit']]
+            display_df.columns = ['Product', 'Buying Price', 'Selling Price', 'Quantity Sold', 'Profit']
+            st.dataframe(display_df)
+            
+            # Visualization
+            fig = px.bar(display_df, x='name', y='profit', title='Profit by Product')
+            st.plotly_chart(fig)
+        else:
+            st.info("No sales recorded for selected date.")
+
+    # Add Products
+    elif menu == "Add Products":
+        st.markdown('<h2 class="sub-header">Add New Products</h2>', unsafe_allow_html=True)
+        
+        with st.form("product_form"):
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                name = st.text_input("Product Name")
+            
+            with col2:
+                buying_price = st.number_input("Buying Price (KSh)", min_value=0.0, step=10.0)
+            
+            with col3:
+                selling_price = st.number_input("Selling Price (KSh)", min_value=0.0, step=10.0)
+            
+            submitted = st.form_submit_button("Add Product")
+            
+            if submitted:
+                if name and selling_price > buying_price:
+                    add_product(user_id, name, buying_price, selling_price)
+                    st.success(f"Product '{name}' added successfully!")
+                elif selling_price <= buying_price:
+                    st.error("Selling price must be higher than buying price!")
+                else:
+                    st.error("Please fill all fields!")
+
+    # Update Stock
+    elif menu == "Update Stock":
+        st.markdown('<h2 class="sub-header">Update Stock Levels</h2>', unsafe_allow_html=True)
+        
+        products_df = get_products(user_id)
+        
+        if not products_df.empty:
+            with st.form("stock_form"):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    product_names = products_df['name'].tolist()
+                    selected_product = st.selectbox("Select Product", product_names)
+                    product_id = products_df[products_df['name'] == selected_product]['id'].values[0]
+                
+                with col2:
+                    quantity = st.number_input("Quantity", min_value=1, step=1)
+                
+                with col3:
+                    stock_date = st.date_input("Stock Date", value=date.today())
+                
+                submitted = st.form_submit_button("Update Stock")
+                
+                if submitted:
+                    update_stock(user_id, product_id, quantity, stock_date)
+                    st.success(f"Stock updated for {selected_product}!")
+        else:
+            st.info("No products available. Please add products first.")
+
+    # Record Sales
+    elif menu == "Record Sales":
+        st.markdown('<h2 class="sub-header">Record Sales</h2>', unsafe_allow_html=True)
+        
+        products_df = get_products(user_id)
+        
+        if not products_df.empty:
+            with st.form("sales_form"):
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    product_names = products_df['name'].tolist()
+                    selected_product = st.selectbox("Select Product", product_names)
+                    product_id = products_df[products_df['name'] == selected_product]['id'].values[0]
+                    
+                    # Show product details
+                    product = products_df[products_df['id'] == product_id].iloc[0]
+                    st.write(f"Buying Price: KSh {product['buying_price']:,.2f}")
+                    st.write(f"Selling Price: KSh {product['selling_price']:,.2f}")
+                    st.write(f"Profit per Unit: KSh {product['selling_price'] - product['buying_price']:,.2f}")
+                
+                with col2:
+                    quantity = st.number_input("Quantity Sold", min_value=1, step=1)
+                
+                with col3:
+                    sale_date = st.date_input("Sale Date", value=date.today())
+                    
+                    # Calculate profit for this sale
+                    profit = (product['selling_price'] - product['buying_price']) * quantity
+                    st.metric("Profit from this Sale", f"KSh {profit:,.2f}")
+                
+                submitted = st.form_submit_button("Record Sale")
+                
+                if submitted:
+                    record_sale(user_id, product_id, quantity, sale_date)
+                    st.success(f"Sale recorded for {selected_product}!")
+        else:
+            st.info("No products available. Please add products first.")
+
+    # View Reports
+    elif menu == "View Reports":
+        st.markdown('<h2 class="sub-header">Sales Reports</h2>', unsafe_allow_html=True)
+        
+        # Date range selector
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input("Start Date", value=date.today().replace(day=1))
+        with col2:
+            end_date = st.date_input("End Date", value=date.today())
+        
+        if st.button("Generate Report"):
+            sales_df = get_sales_report(user_id, start_date, end_date)
+            
+            if not sales_df.empty:
+                # Summary statistics
+                total_profit = sales_df['profit'].sum()
+                total_sales = sales_df['quantity'].sum()
+                avg_daily_profit = sales_df.groupby('date')['profit'].sum().mean()
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Total Profit", f"KSh {total_profit:,.2f}")
+                col2.metric("Total Items Sold", f"{total_sales:,}")
+                col3.metric("Average Daily Profit", f"KSh {avg_daily_profit:,.2f}")
+                
+                # Daily profit trend
+                daily_profit = sales_df.groupby('date')['profit'].sum().reset_index()
+                fig = px.line(daily_profit, x='date', y='profit', 
+                             title='Daily Profit Trend', labels={'profit': 'Profit (KSh)', 'date': 'Date'})
+                st.plotly_chart(fig)
+                
+                # Product performance
+                product_profit = sales_df.groupby('name')['profit'].sum().reset_index()
+                product_profit = product_profit.sort_values('profit', ascending=False)
+                fig2 = px.bar(product_profit, x='name', y='profit', 
+                             title='Profit by Product', labels={'profit': 'Profit (KSh)', 'name': 'Product'})
+                st.plotly_chart(fig2)
+                
+                # Show detailed data
+                st.subheader("Detailed Sales Data")
+                display_df = sales_df[['date', 'name', 'buying_price', 'selling_price', 'quantity', 'profit']]
+                display_df.columns = ['Date', 'Product', 'Buying Price', 'Selling Price', 'Quantity', 'Profit']
+                st.dataframe(display_df)
+            else:
+                st.info("No sales data available for the selected date range.")
+
+# Main app logic
+def main():
+    try:
+        # Check if user is authenticated
+        user_cookie = cookies.get("duka_user")
+        user = get_current_user()
+        
+        if user and user.user:
+            show_app()
+        else:
+            show_auth()
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
+        st.info("Please refresh the page or sign in again.")
+
+if __name__ == "__main__":
+    main()
+```
+
+## Setup Instructions for Supabase
+
+1. **Create a Supabase Account and Project**:
+   - Go to https://supabase.com/ and create an account
+   - Create a new project and note your API URL and anon key
+
+2. **Set Up Database Tables**:
+   Run these SQL commands in the Supabase SQL editor:
+
+```sql
+-- Create shops table
+CREATE TABLE shops (
+    id UUID REFERENCES auth.users(id) PRIMARY KEY,
+    shop_name TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
+);
+
+-- Create products table
+CREATE TABLE products (
+    id UUID DEFAULT extensions.uuid_generate_v4() PRIMARY KEY,
+    shop_id UUID REFERENCES shops(id) ON DELETE CASCADE NOT NULL,
+    name TEXT NOT NULL,
+    buying_price REAL NOT NULL,
+    selling_price REAL NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
+);
+
+-- Create stock table
+CREATE TABLE stock (
+    id UUID DEFAULT extensions.uuid_generate_v4() PRIMARY KEY,
+    shop_id UUID REFERENCES shops(id) ON DELETE CASCADE NOT NULL,
+    product_id UUID REFERENCES products(id) ON DELETE CASCADE NOT NULL,
+    quantity INTEGER NOT NULL,
+    date DATE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
+);
+
+-- Create sales table
+CREATE TABLE sales (
+    id UUID DEFAULT extensions.uuid_generate_v4() PRIMARY KEY,
+    shop_id UUID REFERENCES shops(id) ON DELETE CASCADE NOT NULL,
+    product_id UUID REFERENCES products(id) ON DELETE CASCADE NOT NULL,
+    quantity INTEGER NOT NULL,
+    date DATE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT TIMEZONE('utc'::text, NOW()) NOT NULL
+);
+
+-- Enable Row Level Security
+ALTER TABLE shops ENABLE ROW LEVEL SECURITY;
+ALTER TABLE products ENABLE ROW LEVEL SECURITY;
+ALTER TABLE stock ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sales ENABLE ROW LEVEL SECURITY;
+
+-- Create policies to allow users to access only their own data
+CREATE POLICY "Users can view own shop" ON shops FOR SELECT USING (auth.uid() = id);
+CREATE POLICY "Users can insert own shop" ON shops FOR INSERT WITH CHECK (auth.uid() = id);
+CREATE POLICY "Users can update own shop" ON shops FOR UPDATE USING (auth.uid() = id);
+
+CREATE POLICY "Users can view own products" ON products FOR SELECT USING (auth.uid() = shop_id);
+CREATE POLICY "Users can manage own products" ON products FOR ALL USING (auth.uid() = shop_id);
+
+CREATE POLICY "Users can view own stock" ON stock FOR SELECT USING (auth.uid() = shop_id);
+CREATE POLICY "Users can manage own stock" ON stock FOR ALL USING (auth.uid() = shop_id);
+
+CREATE POLICY "Users can view own sales" ON sales FOR SELECT USING (auth.uid() = shop_id);
+CREATE POLICY "Users can manage own sales" ON sales FOR ALL USING (auth.uid() = shop_id);
+```
+
+3. **Set Up Streamlit Secrets**:
+   In your Streamlit app, create a `.streamlit/secrets.toml` file with:
+
+```toml
+SUPABASE_URL = "your-supabase-url"
+SUPABASE_KEY = "your-supabase-anon-key"
+COOKIE_PASSWORD = "your-secret-cookie-password"
+```
+
+4. **Deploy to Streamlit Sharing**:
+   - Push your code to a GitHub repository
+   - Connect the repository to Streamlit Sharing
+   - Add your secrets to the Streamlit Sharing dashboard
+
+This application now supports multiple shops with secure authentication and data isolation. Each shop owner can only access their own data, making it perfect for your SaaS business model.
