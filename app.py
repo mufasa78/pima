@@ -16,7 +16,10 @@ st.set_page_config(
 @st.cache_resource
 def init_supabase():
     supabase_url = "https://dbwguevzaldnkveqfagd.supabase.co"
-    supabase_key = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRid2d1ZXZ6YWxkbmt2ZXFmYWdkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgyODE1MzIsImV4cCI6MjA3Mzg1NzUzMn0.HSvSlO__1niN4W6ae7FoaQ2QRa23PY7eroreyCuAYow")
+    supabase_key = os.getenv("SUPABASE_KEY")
+    if not supabase_key:
+        st.error("SUPABASE_KEY environment variable is required but not set.")
+        st.stop()
     return create_client(supabase_url, supabase_key)
 
 supabase = init_supabase()
@@ -185,11 +188,13 @@ def show_auth():
                     response, error = sign_in(email, password)
                     if error:
                         st.error(f"Sign in failed: {error}")
-                    else:
+                    elif response and response.user:
                         st.session_state['authenticated'] = True
                         st.session_state['user_id'] = response.user.id
                         st.success("Successfully signed in!")
                         st.rerun()
+                    else:
+                        st.error("Sign in failed: Invalid response")
                 else:
                     st.error("Please enter both email and password")
     
@@ -261,8 +266,7 @@ def show_app():
             # Visualization
             if len(sales_details) > 0:
                 fig = px.bar(sales_details, x='name', y='profit', title='Profit by Product')
-                fig.update_xaxis(title='Product')
-                fig.update_yaxis(title='Profit (KSh)')
+                fig.update_layout(xaxis_title='Product', yaxis_title='Profit (KSh)')
                 st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("No sales recorded for selected date.")
@@ -321,7 +325,11 @@ def show_app():
                 with col1:
                     product_names = products_df['name'].tolist()
                     selected_product = st.selectbox("Select Product", product_names)
-                    product_id = products_df[products_df['name'] == selected_product]['id'].values[0]
+                    product_id_map = dict(zip(products_df['name'], products_df['id']))
+                    product_id = product_id_map.get(selected_product)
+                    if product_id is None:
+                        st.error("Product not found")
+                        st.stop()
                 
                 with col2:
                     quantity = st.number_input("Quantity", min_value=1, step=1)
@@ -353,7 +361,11 @@ def show_app():
                 with col1:
                     product_names = products_df['name'].tolist()
                     selected_product = st.selectbox("Select Product", product_names)
-                    product_id = products_df[products_df['name'] == selected_product]['id'].values[0]
+                    product_id_map = dict(zip(products_df['name'], products_df['id']))
+                    product_id = product_id_map.get(selected_product)
+                    if product_id is None:
+                        st.error("Product not found")
+                        st.stop()
                 
                 with col2:
                     quantity = st.number_input("Quantity Sold", min_value=1, step=1)
@@ -410,8 +422,7 @@ def show_app():
                     if len(report_df) > 0:
                         daily_profit = report_df.groupby('date')['profit'].sum().reset_index()
                         fig = px.line(daily_profit, x='date', y='profit', title='Daily Profit Trend')
-                        fig.update_xaxis(title='Date')
-                        fig.update_yaxis(title='Profit (KSh)')
+                        fig.update_layout(xaxis_title='Date', yaxis_title='Profit (KSh)')
                         st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.info("No sales data found for the selected date range.")
