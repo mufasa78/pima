@@ -2,234 +2,427 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
 import plotly.express as px
-from supabase import create_client, Client
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
+from typing import Optional, Tuple
+import re
+import bcrypt
+from dotenv import load_dotenv
+import uuid
+import hashlib
+import json
+
+# Load environment variables from .env file
+load_dotenv()
+
+def validate_password(password: str) -> tuple[bool, str]:
+    """
+    Validate password strength.
+    Returns (is_valid, message)
+    """
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long"
+    if not re.search(r"[A-Z]", password):
+        return False, "Password must contain at least one uppercase letter"
+    if not re.search(r"[a-z]", password):
+        return False, "Password must contain at least one lowercase letter"
+    if not re.search(r"\d", password):
+        return False, "Password must contain at least one number"
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+        return False, "Password must contain at least one special character"
+    return True, "Password is strong"
+
+def validate_env_vars() -> Optional[str]:
+    """Validate all required environment variables are set."""
+    required_vars = {
+        "DATABASE_URL": "PostgreSQL connection URL for NeonDB"
+    }
+    
+    missing_vars = []
+    for var, description in required_vars.items():
+        if not os.getenv(var):
+            missing_vars.append(f"{var} ({description})")
+    
+    if missing_vars:
+        return f"Missing required environment variables:\n" + "\n".join(missing_vars)
+    return None
+
+# Validate environment variables
+if error_message := validate_env_vars():
+    st.error(error_message)
+    st.stop()
 
 # Set page config
 st.set_page_config(
-    page_title="Duka Profit Tracker",
+    page_title="Pima",
     page_icon="📊",
     layout="wide"
 )
 
-# Initialize Supabase client
-@st.cache_resource
-def init_supabase():
-    supabase_url = "https://dbwguevzaldnkveqfagd.supabase.co"
-    supabase_key = os.getenv("SUPABASE_KEY")
-    if not supabase_key:
-        st.error("SUPABASE_KEY environment variable is required but not set.")
-        st.stop()
-    return create_client(supabase_url, supabase_key)
+# Session management functions
+def init_session():
+    """Initialize session state variables."""
+    if 'authenticated' not in st.session_state:
+        st.session_state['authenticated'] = False
+    if 'user_id' not in st.session_state:
+        st.session_state['user_id'] = None
+    if 'user_data' not in st.session_state:
+        st.session_state['user_data'] = None
+    if 'is_loading' not in st.session_state:
+        st.session_state['is_loading'] = False
 
-supabase = init_supabase()
+# Initialize session
+init_session()
+
+# Database connection functions
+def get_db_connection():
+    """Create and return a fresh database connection."""
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        st.error("DATABASE_URL environment variable is required but not set.")
+        st.stop()
+        
+    try:
+        conn = psycopg2.connect(database_url)
+        return conn
+    except Exception as e:
+        st.error(f"Failed to connect to database: {e}")
+        st.stop()
+
+def execute_query(query: str, params: tuple = None, fetch: bool = False):
+    """Execute a database query and return results if fetch=True."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            if fetch:
+                return cur.fetchall()
+            conn.commit()
+            return cur.rowcount
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
+
+def execute_query_one(query: str, params: tuple = None):
+    """Execute a database query and return a single result."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    except Exception as e:
+        conn.rollback()
+        raise e
+    finally:
+        conn.close()
 
 # Authentication functions
-def sign_up(email, password, shop_name):
-    try:
-        response = supabase.auth.sign_up({
-            "email": email,
-            "password": password,
-        })
-        
-        if response.user:
-            # Create shop profile
-            shop_result = supabase.table("shops").insert({
-                "id": response.user.id,
-                "shop_name": shop_name,
-                "created_at": datetime.now().isoformat()
-            }).execute()
-            
-            # Check if email confirmation is required
-            if not response.session:
-                return response, "Please check your email to confirm your account before signing in."
-            
-            return response, None
-        elif hasattr(response, 'error') and response.error:
-            return None, f"Sign up failed: {response.error.message}"
-        else:
-            return None, "Failed to create account - unknown error"
-    except Exception as e:
-        return None, f"Sign up error: {str(e)}"
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt."""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-def sign_in(email, password):
-    try:
-        response = supabase.auth.sign_in_with_password({
-            "email": email,
-            "password": password
-        })
-        
-        if response.user and response.session:
-            return response, None
-        elif hasattr(response, 'error') and response.error:
-            return None, f"Sign in failed: {response.error.message}"
-        else:
-            return None, "Sign in failed: Invalid credentials or unconfirmed email"
-    except Exception as e:
-        return None, f"Sign in error: {str(e)}"
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify a password against its hash."""
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
 
-def get_current_user():
+def sign_up(email: str, password: str, shop_name: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Create a new user account and shop."""
     try:
-        return supabase.auth.get_user()
-    except:
+        # Check if user already exists
+        existing_user = execute_query_one(
+            "SELECT id FROM users WHERE email = %s",
+            (email,)
+        )
+        
+        if existing_user:
+            return None, "An account with this email already exists"
+        
+        # Hash password
+        password_hash = hash_password(password)
+        
+        # Create user
+        user_id = str(uuid.uuid4())
+        execute_query(
+            "INSERT INTO users (id, email, password_hash) VALUES (%s, %s, %s)",
+            (user_id, email, password_hash)
+        )
+        
+        # Create shop
+        execute_query(
+            "INSERT INTO shops (id, shop_name) VALUES (%s, %s)",
+            (user_id, shop_name)
+        )
+        
+        user_data = {
+            'id': user_id,
+            'email': email,
+            'shop_name': shop_name
+        }
+        
+        return user_data, None
+        
+    except Exception as e:
+        return None, f"Sign up failed: {str(e)}"
+
+def sign_in(email: str, password: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Sign in a user with email and password."""
+    try:
+        # Get user by email
+        user = execute_query_one(
+            "SELECT u.id, u.email, u.password_hash, s.shop_name FROM users u LEFT JOIN shops s ON u.id = s.id WHERE u.email = %s",
+            (email,)
+        )
+        
+        if not user:
+            return None, "Invalid email or password"
+        
+        # Verify password
+        if not verify_password(password, user['password_hash']):
+            return None, "Invalid email or password"
+        
+        user_data = {
+            'id': user['id'],
+            'email': user['email'],
+            'shop_name': user['shop_name']
+        }
+        
+        return user_data, None
+        
+    except Exception as e:
+        return None, f"Sign in failed: {str(e)}"
+
+def get_current_user() -> Optional[dict]:
+    """Get current user from session state."""
+    try:
+        # Check session state
+        if st.session_state.get('authenticated') and st.session_state.get('user_id'):
+            # Return cached user data if available
+            if st.session_state.get('user_data'):
+                return st.session_state['user_data']
+            
+            # Fetch user data from database
+            user_id = st.session_state['user_id']
+            user = execute_query_one(
+                "SELECT u.id, u.email, s.shop_name FROM users u LEFT JOIN shops s ON u.id = s.id WHERE u.id = %s",
+                (user_id,)
+            )
+            
+            # Cache user data in session
+            if user:
+                st.session_state['user_data'] = user
+            
+            return user
+        
+        return None
+        
+    except Exception:
         return None
 
 def sign_out():
-    supabase.auth.sign_out()
-    if 'user_id' in st.session_state:
-        del st.session_state['user_id']
-    if 'authenticated' in st.session_state:
-        del st.session_state['authenticated']
+    """Sign out the current user."""
+    # Clear all session state
+    st.session_state['authenticated'] = False
+    st.session_state['user_id'] = None
+    st.session_state['user_data'] = None
+    st.session_state['is_loading'] = False
+    
+    # Clear any other session keys that might exist
+    keys_to_clear = [k for k in st.session_state.keys() if k.startswith('user_') or k in ['authenticated']]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+    
     st.rerun()
 
 # Database functions
-def get_products(user_id):
+def get_products(user_id: str) -> pd.DataFrame:
+    """Get all products for a shop."""
     try:
-        response = supabase.table("products").select("*").eq("shop_id", user_id).execute()
-        return pd.DataFrame(response.data)
-    except:
+        products = execute_query(
+            "SELECT id, name, buying_price, selling_price, created_at FROM products WHERE shop_id = %s ORDER BY created_at DESC",
+            (user_id,),
+            fetch=True
+        )
+        return pd.DataFrame(products)
+    except Exception as e:
+        st.error(f"Error fetching products: {e}")
         return pd.DataFrame()
 
-def add_product(user_id, name, buying_price, selling_price):
-    supabase.table("products").insert({
-        "shop_id": user_id,
-        "name": name,
-        "buying_price": buying_price,
-        "selling_price": selling_price,
-        "created_at": datetime.now().isoformat()
-    }).execute()
+def add_product(user_id: str, name: str, buying_price: float, selling_price: float):
+    """Add a new product to the shop."""
+    execute_query(
+        "INSERT INTO products (shop_id, name, buying_price, selling_price) VALUES (%s, %s, %s, %s)",
+        (user_id, name, buying_price, selling_price)
+    )
 
-def update_stock(user_id, product_id, quantity, stock_date):
-    supabase.table("stock").insert({
-        "shop_id": user_id,
-        "product_id": product_id,
-        "quantity": quantity,
-        "date": stock_date.isoformat(),
-        "created_at": datetime.now().isoformat()
-    }).execute()
+def update_stock(user_id: str, product_id: str, quantity: int, stock_date: date):
+    """Update stock for a product."""
+    execute_query(
+        "INSERT INTO stock (shop_id, product_id, quantity, date) VALUES (%s, %s, %s, %s)",
+        (user_id, product_id, quantity, stock_date)
+    )
 
-def record_sale(user_id, product_id, quantity, sale_date):
-    supabase.table("sales").insert({
-        "shop_id": user_id,
-        "product_id": product_id,
-        "quantity": quantity,
-        "date": sale_date.isoformat(),
-        "created_at": datetime.now().isoformat()
-    }).execute()
+def record_sale(user_id: str, product_id: str, quantity: int, sale_date: date):
+    """Record a sale."""
+    execute_query(
+        "INSERT INTO sales (shop_id, product_id, quantity, date) VALUES (%s, %s, %s, %s)",
+        (user_id, product_id, quantity, sale_date)
+    )
 
-def get_daily_profit(user_id, target_date):
+def get_daily_profit(user_id: str, target_date: date) -> Tuple[float, pd.DataFrame]:
+    """Get daily profit and sales details for a specific date."""
     try:
-        # Get sales for the day
-        sales_response = supabase.table("sales").select("*, products(name, buying_price, selling_price)").eq("shop_id", user_id).eq("date", target_date.isoformat()).execute()
+        # Get sales for the day with product information
+        sales_data = execute_query(
+            """
+            SELECT s.quantity, p.name, p.buying_price, p.selling_price
+            FROM sales s
+            JOIN products p ON s.product_id = p.id
+            WHERE s.shop_id = %s AND s.date = %s
+            ORDER BY s.created_at DESC
+            """,
+            (user_id, target_date),
+            fetch=True
+        )
         
-        sales_data = sales_response.data
         if not sales_data:
             return 0, pd.DataFrame()
-            
+        
         # Process sales data
         sales_list = []
         total_profit = 0
         
         for sale in sales_data:
-            product_info = sale.get('products', {})
-            buying_price = product_info.get('buying_price', 0)
-            selling_price = product_info.get('selling_price', 0)
-            quantity = sale.get('quantity', 0)
-            
-            profit = (selling_price - buying_price) * quantity
+            profit = (sale['selling_price'] - sale['buying_price']) * sale['quantity']
             total_profit += profit
             
             sales_list.append({
-                'name': product_info.get('name', 'Unknown'),
-                'buying_price': buying_price,
-                'selling_price': selling_price,
-                'sold_quantity': quantity,
+                'name': sale['name'],
+                'buying_price': float(sale['buying_price']),
+                'selling_price': float(sale['selling_price']),
+                'sold_quantity': sale['quantity'],
                 'profit': profit
             })
         
         return total_profit, pd.DataFrame(sales_list)
+        
     except Exception as e:
         st.error(f"Error calculating profit: {e}")
         return 0, pd.DataFrame()
 
-def get_sales_report(user_id, start_date, end_date):
+def get_sales_report(user_id: str, start_date: date, end_date: date) -> pd.DataFrame:
+    """Get sales report for a date range."""
     try:
-        response = supabase.table("sales").select("*, products(name, buying_price, selling_price)").eq("shop_id", user_id).gte("date", start_date.isoformat()).lte("date", end_date.isoformat()).execute()
+        sales_data = execute_query(
+            """
+            SELECT s.date, s.quantity, p.name, p.buying_price, p.selling_price
+            FROM sales s
+            JOIN products p ON s.product_id = p.id
+            WHERE s.shop_id = %s AND s.date >= %s AND s.date <= %s
+            ORDER BY s.date DESC, s.created_at DESC
+            """,
+            (user_id, start_date, end_date),
+            fetch=True
+        )
         
-        sales_data = response.data
         if not sales_data:
             return pd.DataFrame()
-            
+        
         processed_data = []
         for sale in sales_data:
-            product_info = sale.get('products', {})
+            profit = (float(sale['selling_price']) - float(sale['buying_price'])) * sale['quantity']
             processed_data.append({
-                'date': sale.get('date'),
-                'name': product_info.get('name', 'Unknown'),
-                'buying_price': product_info.get('buying_price', 0),
-                'selling_price': product_info.get('selling_price', 0),
-                'quantity': sale.get('quantity', 0),
-                'profit': (product_info.get('selling_price', 0) - product_info.get('buying_price', 0)) * sale.get('quantity', 0)
+                'date': sale['date'],
+                'name': sale['name'],
+                'buying_price': float(sale['buying_price']),
+                'selling_price': float(sale['selling_price']),
+                'quantity': sale['quantity'],
+                'profit': profit
             })
         
         return pd.DataFrame(processed_data)
+        
     except Exception as e:
         st.error(f"Error generating report: {e}")
         return pd.DataFrame()
 
-# Initialize session state
-if 'authenticated' not in st.session_state:
-    st.session_state['authenticated'] = False
-if 'user_id' not in st.session_state:
-    st.session_state['user_id'] = None
+
 
 # Authentication UI
 def show_auth():
-    st.title("📊 Duka Profit Tracker")
+    st.title("📊 Pima")
     st.markdown("**Track your daily profits with ease**")
     
     tab1, tab2 = st.tabs(["Sign In", "Sign Up"])
     
     with tab1:
         with st.form("sign_in_form"):
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
+            email = st.text_input("Email", placeholder="Enter your email address")
+            password = st.text_input("Password", type="password", placeholder="Enter your password")
             submitted = st.form_submit_button("Sign In")
             
             if submitted:
                 if email and password:
-                    response, error = sign_in(email, password)
-                    if error:
-                        st.error(f"Sign in failed: {error}")
-                    elif response and response.user:
-                        st.session_state['authenticated'] = True
-                        st.session_state['user_id'] = response.user.id
-                        st.success("Successfully signed in!")
-                        st.rerun()
-                    else:
-                        st.error("Sign in failed: Invalid response")
+                    with st.spinner("Signing in..."):
+                        st.session_state['is_loading'] = True
+                        response, error = sign_in(email, password)
+                        st.session_state['is_loading'] = False
+                        
+                        if error:
+                            st.error(f"Sign in failed: {error}")
+                        elif response:
+                            st.session_state['authenticated'] = True
+                            st.session_state['user_id'] = response['id']
+                            st.session_state['user_data'] = response
+                            st.success("Successfully signed in!")
+                            st.rerun()
+                        else:
+                            st.error("Sign in failed: Invalid response")
                 else:
                     st.error("Please enter both email and password")
     
     with tab2:
         with st.form("sign_up_form"):
-            shop_name = st.text_input("Shop Name")
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
+            shop_name = st.text_input("Shop Name", placeholder="Enter your shop name")
+            email = st.text_input("Email", placeholder="Enter your email address")
+            password = st.text_input("Password", type="password", placeholder="Create a strong password")
+            confirm_password = st.text_input("Confirm Password", type="password", placeholder="Re-enter your password")
+            st.markdown("""
+            Password requirements:
+            - At least 8 characters long
+            - Must contain uppercase and lowercase letters
+            - Must contain at least one number
+            - Must contain at least one special character
+            """)
             submitted = st.form_submit_button("Create Account")
             
             if submitted:
-                if shop_name and email and password:
-                    response, error = sign_up(email, password, shop_name)
-                    if error:
-                        if "check your email" in error.lower():
-                            st.info(error)
-                        else:
-                            st.error(error)
-                    else:
-                        st.success("Account created successfully! You can now sign in.")
-                else:
+                if not all([shop_name, email, password, confirm_password]):
                     st.error("Please fill all fields")
+                elif password != confirm_password:
+                    st.error("Passwords do not match")
+                else:
+                    # Validate password
+                    is_valid, message = validate_password(password)
+                    if not is_valid:
+                        st.error(message)
+                    else:
+                        # Validate email format
+                        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+                            st.error("Please enter a valid email address")
+                        else:
+                            response, error = sign_up(email, password, shop_name)
+                            if error:
+                                st.error(error)
+                            elif response:
+                                st.session_state['authenticated'] = True
+                                st.session_state['user_id'] = response['id']
+                                st.session_state['user_data'] = response
+                                st.success("Account created successfully!")
+                                st.rerun()
 
 # Main app UI
 def show_app():
@@ -242,10 +435,10 @@ def show_app():
     # User info and logout
     st.sidebar.markdown("---")
     try:
-        shop_info = supabase.table("shops").select("shop_name").eq("id", user_id).execute()
-        shop_name = shop_info.data[0]["shop_name"] if shop_info.data else "Your Shop"
+        user = get_current_user()
+        shop_name = user['shop_name'] if user and user['shop_name'] else "Your Shop"
         st.sidebar.write(f"Logged in as: **{shop_name}**")
-    except:
+    except Exception:
         st.sidebar.write("Logged in")
     
     if st.sidebar.button("Sign Out"):
@@ -591,9 +784,22 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
             else:
                 st.error("End date must be after start date!")
 
+# Check for existing session
+def check_session():
+    """Check if user has an active session."""
+    try:
+        user = get_current_user()
+        if user and not st.session_state.get('authenticated'):
+            st.session_state['authenticated'] = True
+            st.session_state['user_id'] = user['id']
+            return True
+        return st.session_state.get('authenticated', False)
+    except Exception:
+        return False
+
 # Main app logic
 def main():
-    if not st.session_state['authenticated']:
+    if not check_session():
         show_auth()
     else:
         show_app()
